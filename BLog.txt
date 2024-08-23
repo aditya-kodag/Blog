@@ -1,0 +1,974 @@
+
+app.js
+
+const path = require('path');
+
+const express = require('express');
+const session = require('express-session');
+const csrf = require('csurf');
+
+const sessionConfig = require('./config/session');
+const db = require('./data/database');
+const authRoutes = require('./routes/auth');
+const blogRoutes = require('./routes/blog');
+const authMiddleware = require('./middlewares/auth-middleware');
+const addCSRFTokenMiddleware = require('./middlewares/csrf-token-middleware');
+
+const mongodbSessionStore = sessionConfig.createSessionStore(session);
+
+const app = express();
+
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+
+app.use(express.static('public'));
+app.use(express.urlencoded({ extended: false }));
+
+app.use(session(sessionConfig.createSessionConfig(mongodbSessionStore)));
+app.use(csrf());
+
+app.use(addCSRFTokenMiddleware);
+app.use(authMiddleware);//no need to call the function present inside auth-middleware.js file because it will be executed by express when the request for that middleware is called
+                       //because it works as a middleware and not the function
+
+app.use(authRoutes);//here the order matters because the routes that doesn't need authentication should come first ie. signup or login page
+app.use(blogRoutes);//then the authenticated routes because in this blog.js file firstly we are checking if the user is authenticated or not. so if he fails he will never rich to signup or login page even if he has valid login details
+                    //routes like admin page or editing post page needs authentication
+
+app.use(function(error, req, res, next) {
+  res.render('500');
+})
+
+db.connectToDatabase().then(function () {
+  app.listen(3000);
+});
+
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+session.js 
+
+const mongodbStore = require('connect-mongodb-session');
+
+function createSessionStore(session){
+
+    const MongoDBStore = mongodbStore(session);
+
+    const sessionStore = new MongoDBStore({
+        uri: 'mongodb://localhost:27017',
+        databaseName: 'auth-demo',
+        collection: 'sessions'
+      });
+
+      return sessionStore;
+}
+
+function createSessionConfig(sessionStore){
+    return {
+        secret: 'super-secret',
+        resave: false,
+        saveUninitialized: false,
+        store: sessionStore,
+        cookie: {
+          maxAge: 2 * 24 * 60 * 60 * 1000
+        }
+      }
+}
+
+module.exports = {
+    createSessionStore: createSessionStore,
+    createSessionConfig: createSessionConfig
+};
+
+
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+
+authcontrollers.js
+
+
+const User = require('../models/user');
+const validationSession = require('../validation/validation-session');
+const validation = require('../validation/validation');
+const bcrypt = require('bcryptjs');
+
+function get401(res, req){
+   res.status(401).render('401');
+}
+
+function getSignUp(req, res) {
+
+   let sessionErrorData = validationSession.getSessionErrorData(req, 
+                            { 
+                             email:'', 
+                             confirmEmail:'', 
+                             password:''
+                            }
+                          );
+   
+  
+    // if (!sessionInputData) {
+    //   sessionInputData = {
+    //     hasError: false,
+    //     email: '',
+    //     confirmEmail: '',
+    //     password: '',
+    //   };
+    // }
+  
+    // req.session.inputData = null;
+  
+    res.render('signup', {
+      inputData: sessionErrorData,
+    });
+  }
+
+
+  function getLogIn(req, res) {
+     
+    let sessionErrorData = validationSession.getSessionErrorData(req, 
+      { 
+       email:'', 
+       confirmEmail:'', 
+       password:''
+      }
+    );    
+
+    res.render('login', {
+      inputData: sessionErrorData,
+    });
+  }  
+
+
+  async function signUp(req, res) {
+    const userData = req.body;
+    const enteredEmail = userData.email; // userData['email']
+    const enteredConfirmEmail = userData['confirm-email'];
+    const enteredPassword = userData.password;
+  
+    if (
+      !validation.userDataIsValid(enteredEmail, enteredConfirmEmail, enteredPassword)
+    ) {
+       validationSession.flashErrorsToSession(req, {
+          message: 'Invalid input - please check your data.',
+          email: enteredEmail,
+          confirmEmail: enteredConfirmEmail,
+          password: enteredPassword,
+       },
+       function () {
+        res.redirect('/signup');
+       }) 
+    
+      return;
+    }
+  
+    //checking if the user is already exist so can't sign up
+    const user = new User(enteredEmail, null, null);
+    const existingUser = await user.existingUser();
+  
+    if (existingUser) {
+      validationSession.flashErrorsToSession(req, {
+        message: 'User exists already!.',
+        email: enteredEmail,
+        confirmEmail: enteredConfirmEmail,
+        password: enteredPassword,
+     },
+     function () {
+      res.redirect('/signup');
+     }) 
+
+      return;
+    }
+  
+    // const hashedPassword = await bcrypt.hash(enteredPassword, 12);
+  
+    // const user = {
+    //   email: enteredEmail,
+    //   password: hashedPassword,
+    // };
+  
+    //inserting user
+    const insertUser = new User(enteredEmail, enteredPassword, null);
+    await insertUser.createUser();
+  
+    res.redirect('/login');
+  }
+
+
+
+  async function logIn(req, res) {
+    const userData = req.body;
+    const enteredEmail = userData.email;
+    const enteredConfirmEmail = userData['confirm-email'];
+    const enteredPassword = userData.password;
+  
+    //checking if the user has an account or not
+    const user = new User(enteredEmail, null, null);
+    const existingUser = await user.ifNoSuchUser();
+  
+    if (!existingUser) {
+      validationSession.flashErrorsToSession(req, {
+        message: 'Could not log you in - please check your credentials!',
+        email: enteredEmail,
+        confirmEmail: enteredConfirmEmail,
+        password: enteredPassword,
+     },
+     function () {
+      res.redirect('/login');
+     }) 
+     
+      return;
+    }
+  
+    const passwordsAreEqual = await bcrypt.compare(
+      enteredPassword,
+      existingUser.password
+    );
+  
+    if (!passwordsAreEqual) {
+
+      validationSession.flashErrorsToSession(req, {
+        message: 'Could not log you in - please check your credentials!',
+        email: enteredEmail,
+        password: enteredPassword,
+     },
+     function () {
+      res.redirect('/login');
+     }) 
+     
+      return;
+    }
+  
+    req.session.user = { id: existingUser._id, email: existingUser.email };
+    req.session.isAuthenticated = true;
+    req.session.save(function () {
+      res.redirect('/admin');
+    });
+  }
+
+
+  function logout(req, res) {
+    req.session.user = null;
+    req.session.isAuthenticated = false;
+    res.redirect('/');
+  }
+
+
+ module.exports = {
+                    getSignUp: getSignUp,
+                    getLogIn: getLogIn,
+                    signUp: signUp,
+                    logIn: logIn,
+                    logout: logout,
+                    get401: get401
+                 } 
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+
+post-controllers
+
+
+const Post = require('../models/posts');
+const validationSession = require('../validation/validation-session');
+const validation = require('../validation/validation');
+
+  function getHome (req, res) {
+    res.render('welcome');
+  }
+
+
+  async function getAdmin(req, res) {
+    if (!res.locals.isAuth) {
+      return res.status(401).render('401');
+    }
+  
+    //get all the posts lists from the database
+    //as we don't have any title or content or any id we just want to view the admin page having several posts
+    //so instead of creating an object for each post we just create static method i.e. fetchAll()
+    //so we don't have to pass any kind of arguments to the constructor 
+    const posts = await Post.fetchAll();//this fetchAll() is a static method in posts.js file that's why we call using class itself instead creating object for it
+  
+  let sessionErrorData = validationSession.getSessionErrorData(req, {
+     title: '',
+     content: ''
+  });
+  
+    res.render('admin', {
+      posts: posts,
+      inputData: sessionErrorData,
+    });
+  }  
+
+
+  async function createPost(req, res) {
+    const enteredTitle = req.body.title;
+    const enteredContent = req.body.content;
+  
+    if (
+      !validation.postIsValid(enteredTitle, enteredContent)
+    ) {
+        validationSession.flashErrorsToSession(
+            req, 
+            {
+                message: 'Invalid input - please check your data.',
+                title: enteredTitle,
+                content: enteredContent,
+            }, 
+            function () {
+                res.redirect('/admin');
+            }
+        );
+     
+      return; // or return res.redirect('/admin'); => Has the same effect
+    }
+  
+    //creating a post and store into database
+    const post = new Post(enteredTitle, enteredContent);//check in posts.js file where the constructor has three values even if we are passigng two parameters and the third parameter i.e id will be undefined which is valid because we have place it at the rightmost side
+    await post.save();//check in posts.js file of the models folder where we have return the value still we are not storing it in any constant here which is perfectly valid
+                      //this save() method in that file is async function which will return promise at the end that's why we added the await keyword here
+  
+    res.redirect('/admin');
+  }
+
+
+  async function getSinglePost(req, res, next) {
+
+    // if (!res.locals.isAuth){
+    //    return res.status(401).render('401');
+    // }  we don't have to check this authentication here as we have already did it in the blog.js file
+  
+   let post;
+
+    try {
+       post = new Post(null, null, req.params.id);
+    } catch(error){
+      //return next(error);//this will go to the 500.ejs error handling middleware i.e default error handling middleware automatically when the user enters invalid id to see the post on the seearch bar
+       return res.status(400).render('404');
+    }
+    await post.fetch();
+  
+    if (!post.title || !post.content) {
+      return res.render('404'); // 404.ejs is missing at this point - it will be added later!
+    }
+
+   let sessionErrorData = validationSession.getSessionErrorData(req, 
+                        {
+                          title: post.title,
+                          content: post.content 
+                        });
+    
+  
+    res.render('single-post', {
+      post: post,
+      inputData: sessionErrorData,
+    });
+  }
+
+
+  async function updatePost(req, res) {
+    const enteredTitle = req.body.title;
+    const enteredContent = req.body.content;
+  
+    if (
+      !validation.postIsValid(enteredTitle, enteredContent)
+    ) {
+        validationSession.flashErrorsToSession(
+           req, 
+           {
+             message: 'Invalid input - please check your data.',
+             title: enteredTitle,
+             content: enteredContent,
+           }, 
+           function () {
+            res.redirect(`/posts/${req.params.id}/edit`);
+           }
+        );//go through the validation-session.js file
+  
+      
+      return; 
+    }
+  
+    //updating the post
+    const post = new Post(enteredTitle, enteredContent, req.params.id);
+    await post.save();//check out in posts.js file
+  
+    res.redirect('/admin');
+  }
+
+
+  async function deletePost(req, res) {
+   
+    //deleting the post
+    const post = new Post(null, null, req.params.id);//as i am not intersting in title or content but in id of the post which i want to delete
+    await post.delete();
+  
+    res.redirect('/admin');
+  }
+
+
+  module.exports = {
+     getHome: getHome,
+     getAdmin: getAdmin,
+     createPost: createPost,
+     getSinglePost: getSinglePost,
+     updatePost: updatePost,
+     deletePost: deletePost
+  }
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+database
+
+const mongodb = require('mongodb');
+
+const MongoClient = mongodb.MongoClient;
+
+let database;
+
+async function connectToDatabase() {
+  const client = await MongoClient.connect(
+    'mongodb://localhost:27017'
+  );
+  database = client.db('auth-blog');
+}
+
+function getDb() {
+  if (!database) {
+    throw { message: 'You must connect first!' };
+  }
+  return database;
+}
+
+module.exports = {
+  connectToDatabase: connectToDatabase,
+  getDb: getDb,
+};
+
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+middlewares 
+
+
+
+async function auth (req, res, next) {
+    const user = req.session.user;
+    const isAuth = req.session.isAuthenticated;
+  
+    if (!user || !isAuth) {
+      return next();
+    }
+  
+    res.locals.isAuth = isAuth;
+  
+    next();
+  }
+
+  
+  module.exports = auth;
+
+
+
+
+function guardRoute(req, res, next){
+    if (!res.locals.isAuth){
+        return res.redirect('/401');
+    }
+
+      next();//if the user is authenticated then it will move to the next middleware
+    
+}
+
+module.exports = guardRoute;
+
+
+
+function addCSRFToken(req, res, next){
+    res.locals.csrfToken = req.csrfToken();
+    next();
+}
+
+module.exports = addCSRFToken;
+
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+
+models
+
+
+const mongodb = require('mongodb');
+
+const db = require('../data/database');
+
+const ObjectId = mongodb.ObjectId; 
+
+class Post {
+
+    //id can be undefined somethimes example when someone creatign a post that's why it has beeen put at the righmost side of the parameter list
+    constructor (title , content, id){
+       this.title = title;
+       this.content = content;
+
+       if (id){//may be undefined, if you are creating post then there won't be any id but if you are editing any post then that will carry id
+        this.id = new ObjectId(id);
+       }//we the id is not unndefined i.e if it is present then we create an id from that string using ObjectId() which will be then pass to the save() function below using this.id
+       
+    }
+
+    //to fetch all the posts from the database to show to the user
+    //this function is called by the class itself and not by the object as it is static
+    static async fetchAll(){
+      const posts = await db.getDb().collection('posts').find().toArray();
+      return posts;
+    }
+
+    //to fetch a single post e.g to view the single post
+    async fetch(){
+      if (!this.id){
+        return;
+     }
+
+     const postDocument = await db
+        .getDb()
+        .collection('posts')
+        .findOne({ _id: this.id });
+
+     this.title = postDocument.title;//the title and content was null when we created that object as we passed only id to the constructor and other arguments as null so we change here to the actual values
+     this.content = postDocument.content;//you can see at line no.77 in blog.js file
+
+     return postDocument;
+    }
+
+    //inserting a new post
+   async save (){
+    let result;
+
+    //you can add separate method for updating the post
+      if (this.id){//if id is attached to the post i.e not undefine that means we are updating the existing post
+        result = await db
+        .getDb()
+        .collection('posts')
+        .updateOne(
+          { _id: this.id },
+          { $set: { title: this.title, content: this.content } }
+        );
+      }
+       
+      else {//if it is undefine then that means we are creating a new post it has no id yet
+        result = await db
+           .getDb()
+           .collection('posts')
+           .insertOne({
+            title: this.title,
+            content: this.content
+          });
+      }
+
+        return result;
+    }
+
+    //deleting a post
+    async delete(){
+        
+        if (!this.id){
+            return;
+        }
+
+       const result = await db
+       .getDb()
+       .collection('posts')
+       .deleteOne({ _id: this.id });
+
+      return result;//not necessary
+    }   
+}
+
+module.exports = Post;
+
+
+
+
+const { hash } = require('bcryptjs');
+const db = require('../data/database');
+const bcrypt = require('bcryptjs');
+
+class User {
+
+    constructor (email, password, confirmEmail){
+       this.email = email;
+       this.password = password;
+       this.confirmEmail = confirmEmail;
+   }
+
+    async createUser(){
+
+     const hashedPassword = await bcrypt.hash(this.password, 12);
+
+      const user = {
+        email: this.email,
+        password: hashedPassword,
+      };
+
+        await db
+        .getDb()
+        .collection('users')
+        .insertOne(user);
+    }
+
+    async existingUser(){
+        
+      const existing =  await db
+      .getDb()
+      .collection('users')
+      .findOne({ email: this.email });
+
+      if (existing){
+        return true;
+      }
+      else {
+        return false;
+      }
+    }
+
+    async ifNoSuchUser(){
+
+     const noUser = await db
+      .getDb()
+      .collection('users')
+      .findOne({ email: this.email });
+
+      return noUser;
+    }
+    
+}
+
+
+module.exports = User;
+
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+routes
+
+const express = require('express');
+
+const blogControllers = require('../controllers/post-controllers');
+const guardRoute = require('../middlewares/auth-protection-middleware');
+
+const router = express.Router();
+
+
+router.get('/', blogControllers.getHome);//here getHome() is the function but we don't call it as we point to it whenever it needs to call
+
+router.use(guardRoute);//routes below this line will be protected by unautheticated access from the non-valid user we haven't add it before router.get('/', blogControllers.getHome); because even if the user is not autheticated still he can see atleast the home page
+                    //heere the order of writing this line is so much matter
+
+router.get('/admin', blogControllers.getAdmin);
+
+//router.get('/admin', guardRoute, blogControllers.getAdmin);//here see it has three parameters here the second one checks if the user who is trying to access admin page is authenticated or not
+                                                          //if the user is authenticated then he will be move on to the next middleware i.e blogControllers.getAdmin using next() method used in auth-protection-middleware.js file  
+                                                          //but to add this third parameter that checks if the user accessing the given route is authenticated can become so annoying as you have to add that parameter in the respective functions where the authenticatin is necessary before moving further 
+                                                          //that's why we write route.use(guardRoute)
+
+router.post('/posts', blogControllers.createPost);
+
+
+router.get('/posts/:id/edit', blogControllers.getSinglePost);
+
+
+router.post('/posts/:id/edit', blogControllers.updatePost);
+
+
+router.post('/posts/:id/delete', blogControllers.deletePost);
+
+module.exports = router;
+
+
+
+
+const express = require('express');
+const authControllers = require('../controllers/auth-controllers');
+
+const router = express.Router();
+
+
+router.get('/signup', authControllers.getSignUp);
+
+
+router.get('/login', authControllers.getLogIn);
+
+
+
+router.post('/signup', authControllers.signUp);
+
+
+
+router.post('/login', authControllers.logIn);
+
+
+router.post('/logout', authControllers.logout);
+
+router.get('/401', authControllers.get401);
+
+module.exports = router;
+
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+valiation 
+
+
+function postIsValid(title, content) {
+  return (
+     title &&
+    content &&
+    title.trim() !== '' &&
+    content.trim() !== ''
+  );
+}
+
+function userDataIsValid(enteredEmail, enteredConfirmEmail, enteredPassword){
+  return ( enteredEmail &&
+      enteredConfirmEmail &&
+      enteredPassword &&
+      enteredPassword.trim().length > 6 &&
+      enteredEmail === enteredConfirmEmail &&
+      enteredEmail.includes('@')
+  );
+}
+
+module.exports = {
+    postIsValid: postIsValid,
+    userDataIsValid: userDataIsValid
+}
+
+
+
+----------------------------------------------------------------------------------------------------
+
+
+
+
+ejs
+
+
+
+<%- include('includes/head.ejs', { title: 'Error!' }) %>
+</head>
+<body>
+  <%- include('includes/header.ejs') %>
+  <main>
+    <h1>Not authenticated!</h1>
+    <p>You are not authenticated and therefore not allowed to access this page!</p>
+  </main>
+</body>
+</html>
+
+
+
+
+<%- include('includes/head.ejs', { title: 'Not Found!' }) %>
+</head>
+<body>
+  <%- include('includes/header.ejs') %>
+  <main>
+    <h1>Not found!</h1>
+    <p>Could not find the resource!</p>
+  </main>
+</body>
+</html>
+
+<%- include('includes/head.ejs', { title: 'Error!' }) %>
+</head>
+<body>
+  <%- include('includes/header.ejs') %>
+  <main>
+    <h1>An error ocurred!</h1>
+    <p>Something went wrong - please try again later!</p>
+  </main>
+</body>
+</html>
+
+
+<%- include('includes/head.ejs', { title: 'Admin' }) %>
+<link rel="stylesheet" href="/styles/forms.css">
+<link rel="stylesheet" href="/styles/posts.css">
+</head>
+<body>
+  <%- include('includes/header.ejs') %>
+  <main>
+    <h1>Administrate Blog Posts</h1>
+    <section>
+      <h2>Create a New Post</h2>
+      <%- include('includes/post-form', { 
+        submitUrl: '/posts', 
+        hasError: inputData.hasError, 
+        errorMessage: inputData.message, 
+        title: inputData.title, 
+        content: inputData.content }) 
+      %>
+    </section>
+    <section>
+      <h2>All Blog Posts</h2>
+      <% if (!posts || posts.length === 0) { %>
+        <p>Could not find any posts. You need to first create some!</p>
+      <% } else { %>
+        <ul id="posts-list">
+          <% for (const post of posts) { %>
+            <%- include('includes/post-item', { title: post.title, postId: post._id }) %>
+          <% } %>
+        </ul>
+      <% } %>
+    </section>
+  </main>
+</body>
+</html>
+
+
+<%- include('includes/head.ejs', { title: 'Login' }) %>
+  <link rel="stylesheet" href="/styles/forms.css">
+  <link rel="stylesheet" href="/styles/auth.css">
+</head>
+
+<body>
+  <%- include('includes/header.ejs') %>
+  <main id="signup">
+    <h1>Login</h1>
+    <% if (inputData.hasError) { %>
+      <p id="input-error"><%= inputData.message %></p>
+    <% } %>
+    <form action="/login" method="POST">
+      <input type="hidden" value="<%= locals.csrfToken %>" name="_csrf">
+      <div class="form-control">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" value="<%= inputData.email %>" required>
+      </div>
+      <div class="form-control">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" value="<%= inputData.password %>" required>
+      </div>
+      <button class="btn">Log in</button>
+    </form>
+    <div id="auth-alternative">
+      <a class="btn btn-alt" href="/signup">Create a new user</a>
+    </div>
+  </main>
+</body>
+
+</html>
+
+
+
+<%- include('includes/head.ejs', { title: 'Signup' }) %>
+  <link rel="stylesheet" href="/styles/forms.css">
+  <link rel="stylesheet" href="/styles/auth.css">
+</head>
+
+<body>
+  <%- include('includes/header.ejs') %>
+  <main id="signup">
+    <h1>Signup</h1>
+    <% if (inputData.hasError) { %>
+      <p id="input-error"><%= inputData.message %></p>
+    <% } %>
+    <form action="/signup" method="POST">
+      <input type="hidden" value="<%= locals.csrfToken %>" name="_csrf">
+      <div class="form-control">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" value="<%= inputData.email %>" required>
+      </div>
+      <div class="form-control">
+        <label for="confirm-email">Confirm Email</label>
+        <input type="email" id="confirm-email" name="confirm-email" value="<%= inputData.confirmEmail %>" required>
+      </div>
+      <div class="form-control">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" value="<%= inputData.password %>" required>
+      </div>
+      <button class="btn">Create user</button>
+    </form>
+    <div id="auth-alternative">
+      <a class="btn btn-alt" href="/login">Login instead</a>
+    </div>
+  </main>
+</body>
+
+</html>
+
+
+<%- include('includes/head.ejs', { title: 'View & Edit Blog Post' }) %>
+<link rel="stylesheet" href="/styles/forms.css">
+</head>
+<body>
+  <%- include('includes/header.ejs') %>
+  <main>
+    <%- include('includes/post-form', { 
+      submitUrl: '/posts/' + post.id + '/edit', 
+      hasError: inputData.hasError, 
+      errorMessage: inputData.message, 
+      title: inputData.title, 
+      content: inputData.content }) 
+    %> <!-- as you can see it post.id and not post._id as we have seen several times-->
+  </main>
+</body>
+</html>
+
+
+<%- include('includes/head.ejs', { title: 'Welcome' }) %>
+</head>
+<body>
+  <%- include('includes/header.ejs') %>
+  <main>
+    <h1>Welcome to this demo!</h1>
+    <p>In this demo project, you can create accounts & log in with accounts.</p>
+    <p>In addition, on the <a href="/admin">/admin page</a>, you can perform CRUD operations on blog posts.</p>
+    <p>Please note: There are no "user-facing" views (for non-logged-in users) for those blog posts.</p>
+  </main>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
